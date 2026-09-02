@@ -30,6 +30,12 @@
 #include "config.h"
 #include "web_page.h"
 
+// ДИАГНОСТИКА ОСЦИЛЛОГРАФОМ (временно): GPIO-маркеры на резервных пинах
+// (см. PIN_STATUS_LED/PIN_CAL_BUTTON в config.h — те же физические пины,
+// свободны в v1). Ch1 осциллографа -> PIN_TRACE_BLE, Ch2 -> PIN_TRACE_LEDC.
+#define PIN_TRACE_BLE   PIN_CAL_BUTTON   // GPIO21 — HIGH на время onResult()
+#define PIN_TRACE_LEDC  PIN_STATUS_LED   // GPIO20 — HIGH на время ledcWrite()
+
 // ---------------------------------------------------------------------------
 // Типы
 // ---------------------------------------------------------------------------
@@ -190,24 +196,29 @@ void handleCalibrateSet();
 // ---------------------------------------------------------------------------
 // BLE: колбэк результатов скана
 // ---------------------------------------------------------------------------
+// ДИАГНОСТИКА ОСЦИЛЛОГРАФОМ: маркер HIGH на всё время выполнения тела
+// колбэка — GPIO21, свободный/резервный пин по config.h.
 class TrackerScanCallbacks : public NimBLEScanCallbacks {
   void onResult(const NimBLEAdvertisedDevice* dev) override {
+    digitalWrite(PIN_TRACE_BLE, HIGH);
     std::string addrStr = dev->getAddress().toString();
-    if (addrStr.empty()) return;
-    int rssi = dev->getRSSI();
-    std::string nameStr = dev->getName();
-    upsertBleSeen(addrStr.c_str(), nameStr.c_str(), rssi);
+    if (!addrStr.empty()) {
+      int rssi = dev->getRSSI();
+      std::string nameStr = dev->getName();
+      upsertBleSeen(addrStr.c_str(), nameStr.c_str(), rssi);
 
-    if (bleTarget.active && strcasecmp(addrStr.c_str(), bleTarget.mac) == 0) {
-      bleLastSeenMs = millis();
-      updateEma(bleEma, rssi);
-      if (bleWindowCount < RSSI_SAMPLE_MEDIAN_N) {
-        bleWindow[bleWindowCount++] = (int8_t)rssi;
-      } else {
-        for (int i = 1; i < RSSI_SAMPLE_MEDIAN_N; i++) bleWindow[i - 1] = bleWindow[i];
-        bleWindow[RSSI_SAMPLE_MEDIAN_N - 1] = (int8_t)rssi;
+      if (bleTarget.active && strcasecmp(addrStr.c_str(), bleTarget.mac) == 0) {
+        bleLastSeenMs = millis();
+        updateEma(bleEma, rssi);
+        if (bleWindowCount < RSSI_SAMPLE_MEDIAN_N) {
+          bleWindow[bleWindowCount++] = (int8_t)rssi;
+        } else {
+          for (int i = 1; i < RSSI_SAMPLE_MEDIAN_N; i++) bleWindow[i - 1] = bleWindow[i];
+          bleWindow[RSSI_SAMPLE_MEDIAN_N - 1] = (int8_t)rssi;
+        }
       }
     }
+    digitalWrite(PIN_TRACE_BLE, LOW);
   }
 };
 TrackerScanCallbacks scanCallbacks;
@@ -220,6 +231,12 @@ void setup() {
   delay(50);
   Serial.println();
   Serial.println("=== C6-Tracker boot ===");
+
+  // ДИАГНОСТИКА ОСЦИЛЛОГРАФОМ (временно, см. PIN_TRACE_BLE/PIN_TRACE_LEDC).
+  pinMode(PIN_TRACE_BLE, OUTPUT);
+  pinMode(PIN_TRACE_LEDC, OUTPUT);
+  digitalWrite(PIN_TRACE_BLE, LOW);
+  digitalWrite(PIN_TRACE_LEDC, LOW);
 
   loadCalibration();
 
@@ -303,11 +320,18 @@ void loop() {
 // завершается. НЕ трогай это направление без осциллографа/JTAG-отладки.
 // Рабочий (хоть и не идеальный) вариант — пауза BLE-скана с подтверждением
 // isScanning()==false вокруг записи в handleManual(), см. там.
+// ДИАГНОСТИКА ОСЦИЛЛОГРАФОМ: маркер HIGH ровно на время самого вызова
+// ledcWrite() — GPIO20, свободный/резервный пин по config.h. Смотри на
+// PIN_TRACE_LEDC (Ch2) относительно PIN_TRACE_BLE (Ch1, см. onResult()) —
+// если импульсы пересекаются, значит колбэк радио реально выполняется
+// в момент записи в LEDC несмотря на паузу скана в handleManual().
 void writePulseUs(int pin, int us) {
   if (us < 1) us = 1;
   uint32_t duty = (uint32_t)(((uint64_t)us * SERVO_PWM_MAX_DUTY) / SERVO_PERIOD_US);
   if (duty > SERVO_PWM_MAX_DUTY) duty = SERVO_PWM_MAX_DUTY;
+  digitalWrite(PIN_TRACE_LEDC, HIGH);
   ledcWrite(pin, duty);
+  digitalWrite(PIN_TRACE_LEDC, LOW);
 }
 
 int clampPan(int v)  { return constrain(v, cal.panAngleMin, cal.panAngleMax); }
