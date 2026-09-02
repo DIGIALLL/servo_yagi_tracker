@@ -115,8 +115,15 @@
 #define WEB_SERVER_PORT   80
 
 // BLE
-#define BLE_SCAN_INTERVAL_MS   80   // NimBLE setInterval (в единицах 0.625 мс переводится в коде)
-#define BLE_SCAN_WINDOW_MS     80
+// ВАЖНО (найдено эмпирически на реальном железе ESP32-C6): window ДОЛЖЕН быть
+// заметно меньше interval. При window == interval скан идёт с нулевым зазором
+// (100% duty cycle) и на ESP32-C6 это душит сосуществование радио настолько,
+// что SoftAP перестаёт отвечать на ассоциацию клиентов вообще (проверено:
+// клиенты видят точку по маяку, но не могут подключиться, пока скан активен
+// с нулевым зазором; с ~30% duty cycle — подключаются нормально). Держи
+// window заметно (в разы) меньше interval, не выкручивай оба в максимум.
+#define BLE_SCAN_INTERVAL_MS  160   // NimBLE setInterval (в единицах 0.625 мс переводится в коде)
+#define BLE_SCAN_WINDOW_MS     48   // ~30% duty cycle — реальный зазор для Wi-Fi AP
 #define BLE_ACTIVE_SCAN_DEFAULT false  // пассивный скан по умолчанию (меньше эфирного времени)
 #define BLE_SEEN_LIST_MAX       24     // сколько устройств держим в списке "обнаружено"
 #define BLE_SEEN_TIMEOUT_MS   20000    // через сколько мс устройство пропадает из списка, если не слышно
