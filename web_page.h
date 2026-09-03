@@ -179,12 +179,27 @@ function setLayer(l){
   drawMaps();
 }
 
-let jogTimer=null;
+// Throttle (не debounce!): шлём не чаще раза в 60мс, но не ждём остановки
+// движения — firmware всё равно кладёт в очередь только самую свежую цель
+// (см. servoTask()/qJog в .ino), так что здесь важно не заливать сеть
+// запросами быстрее, чем это реально нужно джойстику, а не защищать плату.
+const JOG_THROTTLE_MS = 60;
+let jogLast = 0, jogTimer = null, jogPending = false;
+function jogSend(){
+  jogLast = performance.now();
+  jogPending = false;
+  fetch('/api/manual?pan='+q('jPan').value+'&tilt='+q('jTilt').value);
+}
 function jog(){
-  clearTimeout(jogTimer);
-  jogTimer=setTimeout(()=>{
-    fetch('/api/manual?pan='+q('jPan').value+'&tilt='+q('jTilt').value);
-  },120);
+  const now = performance.now();
+  const elapsed = now - jogLast;
+  if (elapsed >= JOG_THROTTLE_MS) {
+    clearTimeout(jogTimer);
+    jogSend();
+  } else if (!jogPending) {
+    jogPending = true;
+    jogTimer = setTimeout(jogSend, JOG_THROTTLE_MS - elapsed);
+  }
 }
 
 async function refreshStatus(){

@@ -93,6 +93,15 @@ bool measureWifiThisRun = false;
 int curPanDeg  = PARK_PAN_DEFAULT;
 int curTiltDeg = PARK_TILT_DEFAULT;
 
+// Очередь джога (см. servoTask() и handleManual()): HTTP-хендлер только
+// кладёт СЮДА последнюю запрошенную цель и сразу отвечает клиенту — реальная
+// запись в LEDC происходит в отдельной задаче, вне потока HTTP-сервера и без
+// какого-либо взаимодействия с BLE-сканом. Очередь на 1 элемент +
+// xQueueOverwrite: нужна только самая свежая цель, старые неприменённые
+// значения просто теряются, и это нормально для джойстика.
+struct JogCmd { int16_t pan; int16_t tilt; };
+QueueHandle_t qJog = nullptr;
+
 // цели
 struct { bool active=false; char mac[18]=""; char name[32]=""; } bleTarget;
 struct { bool active=false; char bssid[18]=""; char ssid[33]=""; uint8_t channel=0; } wifiTarget;
@@ -155,6 +164,7 @@ void saveCalibration();
 void writePulseUs(int pin, int us);
 void setPan(int deg);
 void setTilt(int deg);
+void servoTask(void*);
 int  clampPan(int v);
 int  clampTilt(int v);
 int  medianOf(const int8_t* arr, int n);
@@ -251,10 +261,21 @@ void setup() {
   setPan(PARK_PAN_DEFAULT);
   setTilt(PARK_TILT_DEFAULT);
 
+  // Очередь ручного джога + отдельная задача записи в серво — см. servoTask()
+  // и комментарий у struct JogCmd выше про то, почему это вынесено из HTTP.
+  qJog = xQueueCreate(1, sizeof(JogCmd));
+  xTaskCreate(servoTask, "servoTask", 3072, nullptr, 1, nullptr);
+
   // Wi-Fi: AP всегда поднят (веб-морда), STA используется только для сканов,
   // к внешним сетям не подключаемся.
   WiFi.mode(WIFI_AP_STA);
   WiFi.softAP(SOFTAP_SSID, SOFTAP_PASSWORD, SOFTAP_CHANNEL);
+  // ДИАГНОСТИКА (гипотеза): по умолчанию STA-интерфейс (даже ни к чему не
+  // подключённый, поднятый только ради сканов) держит modem sleep включённым.
+  // Периодические переходы радио в сон/пробуждение — известный источник
+  // гонок сосуществования Wi-Fi/BLE на ESP32. Пробуем убрать эту переменную
+  // как возможную причину TG1 WDT сброса при LEDC-записи во время BLE-скана.
+  WiFi.setSleep(false);
   Serial.print("SoftAP SSID: "); Serial.println(SOFTAP_SSID);
   Serial.print("SoftAP IP:   "); Serial.println(WiFi.softAPIP());
 
@@ -309,22 +330,27 @@ void loop() {
 // ---------------------------------------------------------------------------
 // Серво
 // ---------------------------------------------------------------------------
-// Найдено эмпирически на реальном ESP32-C6: ledcWrite() при резкой смене duty
-// ОДНОВРЕМЕННО с активным фоновым BLE-сканом валит плату (Guru Meditation /
-// Task Watchdog) — похоже на конфликт LEDC с тайминг-критичным NimBLE-стеком
-// на единственном ядре C6. ПРОВЕРЕНО и ОТБРОШЕНО: критическая секция
-// (portENTER_CRITICAL/portEXIT_CRITICAL) вокруг ledcWrite() не крашит, а
-// вешает плату НАВСЕГДА (даже сторожевой таймер не срабатывает, раз
-// прерывания реально выключены) — ledcWrite(), похоже, сама ждёт что-то
-// через прерывание, и с выключенными прерываниями это ожидание никогда не
-// завершается. НЕ трогай это направление без осциллографа/JTAG-отладки.
-// Рабочий (хоть и не идеальный) вариант — пауза BLE-скана с подтверждением
-// isScanning()==false вокруг записи в handleManual(), см. там.
-// ДИАГНОСТИКА ОСЦИЛЛОГРАФОМ: маркер HIGH ровно на время самого вызова
-// ledcWrite() — GPIO20, свободный/резервный пин по config.h. Смотри на
-// PIN_TRACE_LEDC (Ch2) относительно PIN_TRACE_BLE (Ch1, см. onResult()) —
-// если импульсы пересекаются, значит колбэк радио реально выполняется
-// в момент записи в LEDC несмотря на паузу скана в handleManual().
+// ИСТОРИЯ РАССЛЕДОВАНИЯ (см. README, раздел "Развитие", там подробно):
+// изначально казалось, что дело в ledcWrite() при резкой смене duty ОДНО-
+// ВРЕМЕННО с активным фоновым BLE-сканом (Guru Meditation / Task Watchdog).
+// ПРОВЕРЕНО и ОТБРОШЕНО: критическая секция (portENTER_CRITICAL/
+// portEXIT_CRITICAL) вокруг ledcWrite() не крашит, а вешает плату НАВСЕГДА —
+// ledcWrite(), похоже, сама ждёт что-то через прерывание, и с выключенными
+// прерываниями это ожидание никогда не завершается. НЕ трогай это
+// направление без осциллографа/JTAG-отладки.
+// РЕАЛЬНАЯ ПРИЧИНА (найдена через JTAG + addr2line по .elf): крash уходит
+// не в LEDC, а в lwIP (sys_arch.c: sys_mbox_trypost / sys_mutex_unlock) —
+// то есть в сам сетевой стек, когда HTTP-поток держится занятым (busy-wait
+// на остановку BLE-скана + delay()) во время активного BLE-скана поверх
+// SoftAP. Официальная документация Espressif (coexist.html, esp32c6) прямо
+// маркирует комбинацию Wi-Fi SoftAP + BLE Scan как "C1: supported but the
+// performance is unstable" — то есть это не наш баг, а официально
+// нестабильная комбинация радио на этом чипе. Лечится не борьбой с LEDC,
+// а тем, чтобы не держать HTTP-обработчик занятым: см. servoTask()/qJog —
+// вся реальная работа с серво вынесена в отдельную задачу, HTTP-хендлер
+// handleManual() только кладёт цель в очередь и сразу отвечает.
+// ДИАГНОСТИКА ОСЦИЛЛОГРАФОМ (оставлено для справки): маркер HIGH ровно на
+// время самого вызова ledcWrite() — GPIO20, см. PIN_TRACE_LEDC/PIN_TRACE_BLE.
 void writePulseUs(int pin, int us) {
   if (us < 1) us = 1;
   uint32_t duty = (uint32_t)(((uint64_t)us * SERVO_PWM_MAX_DUTY) / SERVO_PERIOD_US);
@@ -349,6 +375,31 @@ void setTilt(int deg) {
   long us = map((long)deg, (long)cal.tiltAngleMin, (long)cal.tiltAngleMax, (long)cal.tiltMinUs, (long)cal.tiltMaxUs);
   writePulseUs(PIN_SERVO_TILT, (int)us);
   curTiltDeg = deg;
+}
+
+// Задача ручного джога (см. JogCmd/qJog выше и handleManual() ниже).
+// ПОЧЕМУ ОТДЕЛЬНАЯ ЗАДАЧА: расследование с JTAG (см. README, раздел
+// "Развитие") показало, что крash при ручном джоге происходит не в этом
+// коде, а внутри lwIP (sys_arch.c: sys_mbox_trypost / sys_mutex_unlock) —
+// то есть виновата не сама запись в LEDC, а то, что HTTP-обработчик держал
+// поток занятым (stop() скана + busy-wait + delay()) внутри контекста
+// сетевого стека. Официальная документация Espressif прямо помечает
+// SoftAP+BLE Scan на ESP32-C6 как "C1: supported but the performance is
+// unstable" — то есть сама эта комбинация радио изначально нестабильна под
+// нагрузкой, и лечится это не борьбой с LEDC, а тем, чтобы НЕ держать
+// HTTP-поток занятым во время неё. Поэтому: handleManual() теперь только
+// кладёт цель в очередь и сразу отвечает, а реальная запись в серво (и
+// только она) происходит здесь, в отдельной задаче, вообще не трогающей
+// BLE-скан.
+void servoTask(void*) {
+  JogCmd cmd;
+  int lastPan = INT16_MIN, lastTilt = INT16_MIN;
+  for (;;) {
+    if (xQueueReceive(qJog, &cmd, pdMS_TO_TICKS(50)) == pdTRUE && state == ST_MANUAL) {
+      if (cmd.pan != lastPan)   { setPan(cmd.pan);   lastPan  = cmd.pan; }
+      if (cmd.tilt != lastTilt) { setTilt(cmd.tilt); lastTilt = cmd.tilt; }
+    }
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -830,8 +881,8 @@ void handleStart() {
 void handleStop() {
   state = ST_IDLE; phase = PH_NONE;
   if (wifiScanPending) { WiFi.scanDelete(); wifiScanPending = false; }
-  // Возвращаем фоновый BLE-скан, если он был выключен на время ручного
-  // джога (см. handleManual()) — он выключен, только пока state==ST_MANUAL.
+  // Возвращаем фоновый BLE-скан, выключенный на весь ручной режим при
+  // входе в него (см. handleManual()).
   if (curMode != MODE_WIFI && pBLEScan && !pBLEScan->isScanning()) pBLEScan->start(0, false);
   server.send(200, "application/json", "{\"ok\":true}");
 }
@@ -848,39 +899,30 @@ void handlePark() {
 void handleManual() {
   int pan = server.arg("pan").toInt();
   int tilt = server.arg("tilt").toInt();
+
+  // См. подробный комментарий у servoTask() про то, почему тут больше нет
+  // ни busy-wait/delay() вокруг BLE-скана на каждый запрос, ни прямого
+  // вызова setPan/setTilt: HTTP-обработчик не должен ничего блокировать —
+  // только (опционально) попросить скан остановиться и сразу же положить
+  // цель в очередь. Экспериментально подтверждено (см. README): даже
+  // полностью без единого обращения к BLE-скану в этом хендлере плата
+  // всё равно падает почти сразу под реалистичной нагрузкой — сама
+  // комбинация SoftAP+BLE Scan официально нестабильна на этом чипе
+  // (Espressif coexist.html, статус "C1"), это не лечится на уровне
+  // приложения полностью. Единственное, что реально снижает частоту —
+  // не давать BLE-скану работать одновременно с активным ручным режимом
+  // вообще: останавливаем его ОДИН РАЗ при входе в ST_MANUAL (не на
+  // каждый джог), без ожидания подтверждения — сам stop() неблокирующий.
+  bool enteringManual = (state != ST_MANUAL);
   state = ST_MANUAL; phase = PH_NONE;
-
-  // Найдено эмпирически на реальном ESP32-C6: резкая смена duty серво
-  // ОДНОВРЕМЕННО с активным фоновым BLE-сканом может уронить плату (Guru
-  // Meditation / Task Watchdog reset / Interrupt WDT) — похоже на race
-  // condition на уровне SDK между LEDC и тайминг-критичным NimBLE-стеком
-  // (см. подробный комментарий у writePulseUs про то, почему это НЕ
-  // лечится критической секцией — виснет насмерть вместо краша).
-  // ВАЖНО: перепробовал несколько вариантов (пауза+рестарт вокруг каждой
-  // записи, троттлинг частоты записей, скан выключен на весь джог целиком)
-  // — изолированный стенд с точно такой же комбинацией компонентов
-  // (реальный колбэк, LEDC, HTTP, BLE stop/start, тот же duty cycle)
-  // стабилен вообще всегда, а боевой проект падает при любом из вариантов,
-  // с частотой сбоя, ПЛАВАЮЩЕЙ от прогона к прогону — то есть зависит от
-  // чего-то ещё в масштабе/деталях проекта, что не удалось точно
-  // локализовать за разумное время без осциллографа/JTAG. Ниже — вариант,
-  // показавший на практике наименьшую частоту сбоя из всех перепробованных
-  // (не идеальный, но лучший найденный). Плата сама перезагрузится через
-  // Task Watchdog и восстановится за секунды, если всё-таки словит гонку.
-  if (pBLEScan && pBLEScan->isScanning()) {
+  if (enteringManual && curMode != MODE_WIFI && pBLEScan && pBLEScan->isScanning()) {
     pBLEScan->stop();
-    unsigned long t0 = millis();
-    while (pBLEScan->isScanning() && millis() - t0 < 50) { delay(1); }
-    delay(20);
   }
 
-  setPan(pan);
-  setTilt(tilt);
+  JogCmd cmd{ (int16_t)pan, (int16_t)tilt };
+  xQueueOverwrite(qJog, &cmd);
+
   server.send(200, "application/json", "{\"ok\":true}");
-
-  if (curMode != MODE_WIFI && pBLEScan && !pBLEScan->isScanning()) {
-    pBLEScan->start(0, false);
-  }
 }
 
 void handleMapCsv() {
