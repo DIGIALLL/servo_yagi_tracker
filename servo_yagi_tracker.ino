@@ -100,6 +100,16 @@ bool measureWifiThisRun = false;
 // всей сетке ради пассивного накопления bestPan/bestTilt для ВСЕХ видимых
 // устройств разом (см. upsertBleSeen), без привязки к конкретной цели.
 bool bleFullscanMode = false;
+// track_ble с уже известным углом (см. findBleSeenBest) стартует СРАЗУ с
+// точного скана (ST_FINE), минуя грубый растр. Но обычная FINE-логика
+// использует короткое окно BLE_DWELL_MS_FINE (250мс), рассчитанное на
+// уточнение УЖЕ подтверждённого контакта — она не заменяет "длинный первый
+// контакт" грубого прохода (450мс), который в обычном сценарии как раз и
+// подтверждает, что устройство вообще слышно с этой позиции. Проверено
+// вживую: без этого шорткат стабильно проваливался даже на надёжно
+// рекламирующихся устройствах. Этот флаг держит первый FINE-проход после
+// шортката на длинном окне; сбрасывается после первого прохода сетки.
+bool bleShortcutFirstPass = false;
 
 int curPanDeg  = PARK_PAN_DEFAULT;
 int curTiltDeg = PARK_TILT_DEFAULT;
@@ -194,6 +204,7 @@ void serviceScanState();
 void serviceWifiFullscan();
 void serviceSerial();
 void upsertBleSeen(const char* mac, const char* name, int rssi);
+bool findBleSeenBest(const char* mac, int& pan, int& tilt);
 void buildWifiSeenFromResults(int n);
 const char* stateName(SysState s);
 const char* modeName(RadioMode m);
@@ -489,9 +500,10 @@ void startDwell() {
 
   if (measureBleThisRun) {
     bool fineGrained = (state == ST_FINE || state == ST_REFINE || state == ST_TRACK);
-    unsigned long dwellMs = bleFullscanMode ? BLE_DWELL_MS_FULLSCAN
-                          : fineGrained     ? BLE_DWELL_MS_FINE
-                                            : BLE_DWELL_MS_COARSE;
+    unsigned long dwellMs = bleFullscanMode                  ? BLE_DWELL_MS_FULLSCAN
+                          : (state == ST_FINE && bleShortcutFirstPass) ? BLE_DWELL_MS_COARSE
+                          : fineGrained                       ? BLE_DWELL_MS_FINE
+                                                                : BLE_DWELL_MS_COARSE;
     phase = PH_DWELL_BLE;
     phaseDeadline = millis() + dwellMs;
   } else if (measureWifiThisRun && wifiTarget.active) {
@@ -617,6 +629,10 @@ void serviceScanState() {
 
     case ST_FINE:
       if (wpNext(p, t)) { wpPan = p; wpTilt = t; beginCellPhaseMove(); return; }
+      // Растр FINE пройден целиком (первый проход после шортката или
+      // обычный после coarse) — дальше короткое окно снова уместно, если
+      // вдруг вернёмся в FINE ещё раз.
+      bleShortcutFirstPass = false;
       if (bestVal <= RSSI_NOT_MEASURED) { state = ST_IDLE; return; }
       initRefine();
       state = ST_REFINE;
@@ -699,14 +715,37 @@ void upsertBleSeen(const char* mac, const char* name, int rssi) {
   }
   bleSeen[idx].rssi = rssi;
   bleSeen[idx].lastMs = millis();
-  // Память "лучший угол": обновляется пассивно при КАЖДОМ решении, где бы
-  // антенна сейчас ни находилась (ручной джог, скан другой цели, парковка)
-  // — не только во время специального BLE-скана диапазона.
-  if (rssi > bleSeen[idx].bestRssi) {
+  // Память "лучший угол": обновляется пассивно при любом ДВИЖЕНИИ антенны
+  // (ручной джог, любой скан/слежение) — НО НЕ в ST_IDLE. Проверено вживую
+  // и найдено критичным: в ST_IDLE антенна стоит на месте сколь угодно
+  // долго (пока не придёт следующая команда) — заметно дольше, чем окно
+  // dwell на одной клетке скана (секунды/минуты простоя против ~1с на
+  // клетку). Раз обновление идёт при ЛЮБОМ улучшении RSSI, а первое
+  // обнаружение устройства чаще всего происходит именно во время долгого
+  // простоя (а не во время короткого активного скана), "лучший угол"
+  // получался на деле не "где сигнал сильнее", а "где стояла антенна,
+  // когда мы впервые услышали устройство" — бесполезно и даже вредно для
+  // track_ble. Простой (ST_IDLE) в эту статистику вклада не даёт.
+  if (state != ST_IDLE && rssi > bleSeen[idx].bestRssi) {
     bleSeen[idx].bestRssi = rssi;
     bleSeen[idx].bestPan  = curPanDeg;
     bleSeen[idx].bestTilt = curTiltDeg;
   }
+}
+
+// Ищет запомненный лучший угол для MAC (см. upsertBleSeen) — используется
+// в handleStart(what=track_ble), чтобы не мести слепо всю сетку заново,
+// если устройство уже когда-то ловилось. Возвращает false, если MAC не
+// известен или его ни разу не поймали с валидными координатами.
+bool findBleSeenBest(const char* mac, int& pan, int& tilt) {
+  for (int i = 0; i < BLE_SEEN_LIST_MAX; i++) {
+    if (bleSeen[i].used && strcasecmp(bleSeen[i].mac, mac) == 0) {
+      if (bleSeen[i].bestPan < 0 || bleSeen[i].bestTilt < 0) return false;
+      pan = bleSeen[i].bestPan; tilt = bleSeen[i].bestTilt;
+      return true;
+    }
+  }
+  return false;
 }
 
 // ---------------------------------------------------------------------------
@@ -895,6 +934,7 @@ void handleStart() {
   }
   String what = server.arg("what");
   bleFullscanMode = false;  // сбрасываем на каждый новый /api/start, кроме явного ble_fullscan ниже
+  bleShortcutFirstPass = false;
 
   if (what == "coarse") {
     runMode = RUN_COARSE_ONLY;
@@ -933,6 +973,29 @@ void handleStart() {
   if (measureBleThisRun && pBLEScan && !pBLEScan->isScanning()) pBLEScan->start(0, false);
 
   bestVal = RSSI_NOT_MEASURED; bestPan = curPanDeg; bestTilt = curTiltDeg;
+
+  // Если для track_ble уже есть запомненный лучший угол этой цели (см.
+  // findBleSeenBest/upsertBleSeen) — не метём слепо всю сетку заново.
+  // ПОЧЕМУ ЭТО ВАЖНО: проверено вживую — некоторые устройства (например,
+  // smart-TV) рекламируются заметно реже, чем окно BLE_DWELL_MS_COARSE
+  // (450мс) успевает поймать на КАЖДОЙ клетке грубого растра, из-за чего
+  // цель не находится нигде во всём проходе, хотя реально видна и её
+  // угол уже известен из более медленного ble_fullscan (1200мс/клетка)
+  // или просто пассивного накопления. Стартуем сразу с точного скана
+  // вокруг известной точки — там же и более длинные окна не нужны,
+  // FINE-шаг всё равно намного плотнее.
+  int knownPan, knownTilt;
+  if (what == "track_ble" && findBleSeenBest(bleTarget.mac, knownPan, knownTilt)) {
+    initWaypoints(clampPan(knownPan - FINE_WINDOW_DEG), clampPan(knownPan + FINE_WINDOW_DEG), FINE_STEP_DEG_DEFAULT,
+                  clampTilt(knownTilt - FINE_WINDOW_DEG), clampTilt(knownTilt + FINE_WINDOW_DEG), FINE_STEP_DEG_DEFAULT);
+    bestPan = knownPan; bestTilt = knownTilt;
+    phase = PH_NONE;
+    state = ST_FINE;
+    bleShortcutFirstPass = true;
+    server.send(200, "application/json", "{\"ok\":true,\"skipped_coarse\":true}");
+    return;
+  }
+
   initWaypoints(cal.panAngleMin, cal.panAngleMax, COARSE_STEP_DEG_DEFAULT,
                 cal.tiltAngleMin, cal.tiltAngleMax, COARSE_STEP_DEG_DEFAULT);
   phase = PH_NONE;
