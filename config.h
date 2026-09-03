@@ -128,7 +128,10 @@
 // window заметно (в разы) меньше interval, не выкручивай оба в максимум.
 #define BLE_SCAN_INTERVAL_MS  160   // NimBLE setInterval (в единицах 0.625 мс переводится в коде)
 #define BLE_SCAN_WINDOW_MS     48   // ~30% duty cycle — реальный зазор для Wi-Fi AP
-#define BLE_ACTIVE_SCAN_DEFAULT false  // пассивный скан по умолчанию (меньше эфирного времени)
+#define BLE_ACTIVE_SCAN_DEFAULT true   // активный скан — нужен, чтобы видеть имена устройств
+                                        // (многие кладут имя только в scan response, пассивный
+                                        // скан его не получает). Цена — чуть больше эфирного
+                                        // времени на BLE-стороне.
 #define BLE_SEEN_LIST_MAX       24     // сколько устройств держим в списке "обнаружено"
 #define BLE_SEEN_TIMEOUT_MS   20000    // через сколько мс устройство пропадает из списка, если не слышно
 

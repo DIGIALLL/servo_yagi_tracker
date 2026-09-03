@@ -70,11 +70,11 @@ const char INDEX_HTML[] PROGMEM = R"HTMLPAGE(<!doctype html>
   <div class="row">
     <button id="mBle" onclick="setMode('ble')">BLE</button>
     <button id="mWifi" onclick="setMode('wifi')">Wi-Fi</button>
-    <button id="mBoth" onclick="setMode('both')">Оба (последовательно)</button>
   </div>
-  <p class="small">SoftAP и скан делят один радиомодуль. «Оба» = BLE и Wi-Fi
-  измеряются по очереди в каждой точке сетки, не одновременно. Во время
-  клетки скана веб-морда может подтормаживать — это ожидаемо.</p>
+  <p class="small">SoftAP и скан делят один физический радиомодуль. Одновременная
+  работа BLE и Wi-Fi на этом чипе — самый нестабильный режим из всех
+  проверенных (см. README) — режим "оба сразу" намеренно убран, выбирай
+  ровно одно.</p>
 </div>
 
 <div class="card">
@@ -101,7 +101,6 @@ const char INDEX_HTML[] PROGMEM = R"HTMLPAGE(<!doctype html>
     <button onclick="cmd('start&what=coarse')">Обзор (грубый растр)</button>
     <button class="primary" onclick="cmd('start&what=track_ble')">Навести: BLE</button>
     <button class="primary" onclick="cmd('start&what=track_wifi')">Навести: Wi-Fi</button>
-    <button class="primary" onclick="cmd('start&what=track_both')">Навести: обе карты</button>
   </div>
 </div>
 
@@ -153,7 +152,7 @@ const char INDEX_HTML[] PROGMEM = R"HTMLPAGE(<!doctype html>
 
 <script>
 let layer='ble';
-let mode='both';
+let mode='ble';
 
 function q(id){return document.getElementById(id);}
 
@@ -170,7 +169,6 @@ async function setMode(m){
 function updateModeButtons(){
   q('mBle').className = mode==='ble' ? 'primary' : '';
   q('mWifi').className = mode==='wifi' ? 'primary' : '';
-  q('mBoth').className = mode==='both' ? 'primary' : '';
 }
 function setLayer(l){
   layer=l;

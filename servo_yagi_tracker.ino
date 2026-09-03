@@ -82,7 +82,7 @@ Cal cal;
 Preferences prefs;
 WebServer server(WEB_SERVER_PORT);
 
-RadioMode curMode = MODE_BOTH;
+RadioMode curMode = MODE_BLE;  // безопасный старт: ровно одно радио, см. handleMode()
 SysState  state   = ST_IDLE;
 Metric    activeMetric = METRIC_NONE;
 RunMode   runMode = RUN_COARSE_ONLY;
@@ -822,10 +822,22 @@ void handleSelect() {
 }
 
 void handleMode() {
+  // ВАЖНО: режим "оба сразу" (MODE_BOTH) намеренно убран из принимаемых
+  // значений — см. README, раздел про Wi-Fi/BLE coexistence. Одновременная
+  // работа BLE-скана и Wi-Fi/HTTP-активности на этом чипе — самый рискованный
+  // режим из всех, что мы гоняли (см. полное расследование в README). Раньше
+  // "иначе -> MODE_BOTH" было скрытой ловушкой: любая опечатка в параметре
+  // molча включала самый нестабильный режим. Теперь допустимы только "ble"
+  // и "wifi" явно, всё остальное — ошибка, ничего не меняем втихую.
   String m = server.arg("mode");
-  if (m == "ble") curMode = MODE_BLE;
-  else if (m == "wifi") curMode = MODE_WIFI;
-  else curMode = MODE_BOTH;
+  if (m == "ble") {
+    curMode = MODE_BLE;
+  } else if (m == "wifi") {
+    curMode = MODE_WIFI;
+  } else {
+    server.send(400, "application/json", "{\"ok\":false,\"error\":\"mode must be 'ble' or 'wifi'\"}");
+    return;
+  }
 
   // Явная политика сосуществования: если Wi-Fi-only — фоновый BLE скан
   // останавливаем совсем, не делаем вид, что он "бесплатно" крутится рядом.
@@ -853,10 +865,9 @@ void handleStart() {
   } else if (what == "track_wifi") {
     if (!wifiTarget.active) { server.send(400, "application/json", "{\"ok\":false,\"error\":\"no wifi target\"}"); return; }
     runMode = RUN_FULL; activeMetric = METRIC_WIFI;
-  } else if (what == "track_both") {
-    if (!bleTarget.active && !wifiTarget.active) { server.send(400, "application/json", "{\"ok\":false,\"error\":\"no target\"}"); return; }
-    runMode = RUN_FULL;
-    activeMetric = bleTarget.active ? METRIC_BLE : METRIC_WIFI; // приоритет BLE, если выбраны обе цели
+    // "track_both" намеренно убран — см. handleMode() и README про
+    // разделение BLE/Wi-Fi: одновременная работа обоих радио — самый
+    // рискованный режим на этом чипе, выбирай ровно одно.
   } else {
     server.send(400, "application/json", "{\"ok\":false,\"error\":\"bad what\"}");
     return;
