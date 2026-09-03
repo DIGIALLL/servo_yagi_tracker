@@ -88,8 +88,15 @@ const char INDEX_HTML[] PROGMEM = R"HTMLPAGE(<!doctype html>
 </div>
 
 <div class="card">
-  <h2>BLE устройства (фоновый пассивный скан)</h2>
-  <table id="bleTable"><thead><tr><th>Имя</th><th>MAC</th><th>RSSI</th><th></th></tr></thead>
+  <h2>BLE устройства</h2>
+  <div class="row">
+    <button onclick="cmd('start&what=ble_fullscan')">Полный BLE-скан (по всей сетке)</button>
+  </div>
+  <p class="small">Колонка "Лучший угол" копится пассивно всё время (не только
+  во время полного скана) — держит pan/tilt, на котором конкретное устройство
+  ловилось сильнее всего с момента загрузки платы. Живёт в памяти, не в NVS —
+  пропадает при перезагрузке.</p>
+  <table id="bleTable"><thead><tr><th>Имя</th><th>MAC</th><th>RSSI</th><th>Лучший угол</th><th></th></tr></thead>
   <tbody></tbody></table>
 </div>
 
@@ -222,8 +229,11 @@ async function refreshLists(){
     let tb=q('bleTable').tBodies[0]; tb.innerHTML='';
     bl.forEach(d=>{
       const tr=document.createElement('tr');
-      tr.innerHTML=`<td>${d.name||'—'}</td><td>${d.mac}</td><td>${d.rssi}</td>
-        <td><button onclick="selBle('${d.mac}','${(d.name||'').replace(/'/g,"")}')">выбрать</button></td>`;
+      const hasBest = d.best_pan!==undefined && d.best_pan>=0;
+      const bestCell = hasBest ? `${d.best_pan}°/${d.best_tilt}° (${d.best_rssi}dBm)` : '—';
+      const gotoBtn = hasBest ? `<button onclick="goBest(${d.best_pan},${d.best_tilt})">туда</button>` : '';
+      tr.innerHTML=`<td>${d.name||'—'}</td><td>${d.mac}</td><td>${d.rssi}</td><td>${bestCell}</td>
+        <td><button onclick="selBle('${d.mac}','${(d.name||'').replace(/'/g,"")}')">выбрать</button> ${gotoBtn}</td>`;
       tb.appendChild(tr);
     });
   }catch(e){}
@@ -240,6 +250,13 @@ async function refreshLists(){
 }
 
 function selBle(mac,name){ fetch('/api/select?type=ble&mac='+encodeURIComponent(mac)+'&name='+encodeURIComponent(name)).then(refreshStatus); }
+// "Туда": сразу довернуть антенну на запомненный лучший угол для этого
+// устройства (обычный ручной джог на конкретные координаты), не выбирая
+// его целью и не запуская автонаведение.
+function goBest(pan,tilt){
+  q('jPan').value=pan; q('jTilt').value=tilt;
+  fetch('/api/manual?pan='+pan+'&tilt='+tilt).then(refreshStatus);
+}
 function selWifi(bssid,ch,ssid){ fetch('/api/select?type=wifi&bssid='+encodeURIComponent(bssid)+'&channel='+ch+'&ssid='+encodeURIComponent(ssid)).then(refreshStatus); }
 
 async function wifiFullscan(){

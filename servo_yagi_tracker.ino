@@ -66,6 +66,13 @@ struct BleSeen {
   int  rssi = RSSI_NOT_MEASURED;
   unsigned long lastMs = 0;
   bool used = false;
+  // Память "на каком угле сигнал был сильнее всего", копится пассивно на
+  // каждом onResult() независимо от того, выбрана ли эта цель — живёт в
+  // ОЗУ, до перезагрузки (не в NVS, специально: это разведданные текущей
+  // сессии, не постоянная калибровка).
+  int  bestRssi = RSSI_NOT_MEASURED;
+  int  bestPan  = -1;
+  int  bestTilt = -1;
 };
 
 struct WifiSeen {
@@ -89,6 +96,10 @@ RunMode   runMode = RUN_COARSE_ONLY;
 
 bool measureBleThisRun  = false;
 bool measureWifiThisRun = false;
+// Полный BLE-скан диапазона (см. handleStart what=ble_fullscan): проход по
+// всей сетке ради пассивного накопления bestPan/bestTilt для ВСЕХ видимых
+// устройств разом (см. upsertBleSeen), без привязки к конкретной цели.
+bool bleFullscanMode = false;
 
 int curPanDeg  = PARK_PAN_DEFAULT;
 int curTiltDeg = PARK_TILT_DEFAULT;
@@ -672,6 +683,12 @@ void upsertBleSeen(const char* mac, const char* name, int rssi) {
     strncpy(bleSeen[idx].mac, mac, sizeof(bleSeen[idx].mac) - 1); bleSeen[idx].mac[sizeof(bleSeen[idx].mac) - 1] = 0;
     bleSeen[idx].name[0] = 0;
     bleSeen[idx].used = true;
+    // Слот мог быть переиспользован от другого (вытесненного) устройства —
+    // сбрасываем память лучшего угла, иначе новому MAC достанутся чужие
+    // старые координаты.
+    bleSeen[idx].bestRssi = RSSI_NOT_MEASURED;
+    bleSeen[idx].bestPan  = -1;
+    bleSeen[idx].bestTilt = -1;
   }
   if (name && name[0]) {
     strncpy(bleSeen[idx].name, name, sizeof(bleSeen[idx].name) - 1);
@@ -679,6 +696,14 @@ void upsertBleSeen(const char* mac, const char* name, int rssi) {
   }
   bleSeen[idx].rssi = rssi;
   bleSeen[idx].lastMs = millis();
+  // Память "лучший угол": обновляется пассивно при КАЖДОМ решении, где бы
+  // антенна сейчас ни находилась (ручной джог, скан другой цели, парковка)
+  // — не только во время специального BLE-скана диапазона.
+  if (rssi > bleSeen[idx].bestRssi) {
+    bleSeen[idx].bestRssi = rssi;
+    bleSeen[idx].bestPan  = curPanDeg;
+    bleSeen[idx].bestTilt = curTiltDeg;
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -764,6 +789,11 @@ void handleBleList() {
     if (now - bleSeen[i].lastMs > BLE_SEEN_TIMEOUT_MS) continue;
     JsonObject o = arr.add<JsonObject>();
     o["mac"] = bleSeen[i].mac; o["name"] = bleSeen[i].name; o["rssi"] = bleSeen[i].rssi;
+    // Лучший угол, на котором этот MAC когда-либо ловился сильнее всего
+    // (см. upsertBleSeen) — живёт в ОЗУ до перезагрузки, не в NVS.
+    o["best_rssi"] = bleSeen[i].bestRssi;
+    o["best_pan"]  = bleSeen[i].bestPan;
+    o["best_tilt"] = bleSeen[i].bestTilt;
   }
   String out; serializeJson(doc, out);
   server.send(200, "application/json", out);
@@ -855,10 +885,22 @@ void handleStart() {
     return;
   }
   String what = server.arg("what");
+  bleFullscanMode = false;  // сбрасываем на каждый новый /api/start, кроме явного ble_fullscan ниже
 
   if (what == "coarse") {
     runMode = RUN_COARSE_ONLY;
     activeMetric = bleTarget.active ? METRIC_BLE : (wifiTarget.active ? METRIC_WIFI : METRIC_NONE);
+  } else if (what == "ble_fullscan") {
+    // Полный проход сетки ради накопления bestPan/bestTilt для ВСЕХ видимых
+    // BLE-устройств сразу (см. upsertBleSeen) — цель выбирать не нужно.
+    // Имеет смысл только в режиме mode=ble (иначе BLE-скан вообще выключен).
+    if (curMode == MODE_WIFI) {
+      server.send(400, "application/json", "{\"ok\":false,\"error\":\"switch mode to ble first\"}");
+      return;
+    }
+    runMode = RUN_COARSE_ONLY;
+    bleFullscanMode = true;
+    activeMetric = METRIC_NONE;  // не про конкретную цель — общая разведка эфира
   } else if (what == "track_ble") {
     if (!bleTarget.active) { server.send(400, "application/json", "{\"ok\":false,\"error\":\"no ble target\"}"); return; }
     runMode = RUN_FULL; activeMetric = METRIC_BLE;
@@ -873,7 +915,7 @@ void handleStart() {
     return;
   }
 
-  measureBleThisRun  = bleTarget.active  && (curMode != MODE_WIFI || activeMetric == METRIC_BLE);
+  measureBleThisRun  = (bleTarget.active || bleFullscanMode) && (curMode != MODE_WIFI || activeMetric == METRIC_BLE);
   measureWifiThisRun = wifiTarget.active && (curMode != MODE_BLE  || activeMetric == METRIC_WIFI);
 
   // Если для наведения нужен BLE, а фоновый скан был выключен (режим был
@@ -891,6 +933,7 @@ void handleStart() {
 
 void handleStop() {
   state = ST_IDLE; phase = PH_NONE;
+  bleFullscanMode = false;
   if (wifiScanPending) { WiFi.scanDelete(); wifiScanPending = false; }
   // Возвращаем фоновый BLE-скан, выключенный на весь ручной режим при
   // входе в него (см. handleManual()).
@@ -900,6 +943,7 @@ void handleStop() {
 
 void handlePark() {
   state = ST_IDLE; phase = PH_NONE;
+  bleFullscanMode = false;
   setPan(PARK_PAN_DEFAULT);
   setTilt(PARK_TILT_DEFAULT);
   // См. комментарий в handleStop().
