@@ -489,8 +489,11 @@ void startDwell() {
 
   if (measureBleThisRun) {
     bool fineGrained = (state == ST_FINE || state == ST_REFINE || state == ST_TRACK);
+    unsigned long dwellMs = bleFullscanMode ? BLE_DWELL_MS_FULLSCAN
+                          : fineGrained     ? BLE_DWELL_MS_FINE
+                                            : BLE_DWELL_MS_COARSE;
     phase = PH_DWELL_BLE;
-    phaseDeadline = millis() + (fineGrained ? BLE_DWELL_MS_FINE : BLE_DWELL_MS_COARSE);
+    phaseDeadline = millis() + dwellMs;
   } else if (measureWifiThisRun && wifiTarget.active) {
     startWifiSubScan();
   } else {
@@ -782,13 +785,19 @@ void handleStatus() {
 }
 
 void handleBleList() {
+  // ВАЖНО: раньше устройство пропадало из списка через BLE_SEEN_TIMEOUT_MS
+  // (20с) без единого рекламного пакета — из-за этого пропадала и
+  // возможность довернуться на его best_pan/best_tilt, хотя сама память
+  // (см. upsertBleSeen) никуда не девалась. Теперь список отдаёт ВСЕХ,
+  // кого видели с момента загрузки платы (пока не вытеснены лимитом
+  // BLE_SEEN_LIST_MAX) — "stale" просто помечает, что сейчас его не слышно.
   JsonDocument doc; JsonArray arr = doc.to<JsonArray>();
   unsigned long now = millis();
   for (int i = 0; i < BLE_SEEN_LIST_MAX; i++) {
     if (!bleSeen[i].used) continue;
-    if (now - bleSeen[i].lastMs > BLE_SEEN_TIMEOUT_MS) continue;
     JsonObject o = arr.add<JsonObject>();
     o["mac"] = bleSeen[i].mac; o["name"] = bleSeen[i].name; o["rssi"] = bleSeen[i].rssi;
+    o["stale"] = (now - bleSeen[i].lastMs) > BLE_SEEN_TIMEOUT_MS;
     // Лучший угол, на котором этот MAC когда-либо ловился сильнее всего
     // (см. upsertBleSeen) — живёт в ОЗУ до перезагрузки, не в NVS.
     o["best_rssi"] = bleSeen[i].bestRssi;

@@ -232,7 +232,9 @@ async function refreshLists(){
       const hasBest = d.best_pan!==undefined && d.best_pan>=0;
       const bestCell = hasBest ? `${d.best_pan}°/${d.best_tilt}° (${d.best_rssi}dBm)` : '—';
       const gotoBtn = hasBest ? `<button onclick="goBest(${d.best_pan},${d.best_tilt})">туда</button>` : '';
-      tr.innerHTML=`<td>${d.name||'—'}</td><td>${d.mac}</td><td>${d.rssi}</td><td>${bestCell}</td>
+      const rssiCell = d.stale ? `<span style="opacity:.5">${d.rssi} (нет сейчас)</span>` : d.rssi;
+      if (d.stale) tr.style.opacity='.6';
+      tr.innerHTML=`<td>${d.name||'—'}</td><td>${d.mac}</td><td>${rssiCell}</td><td>${bestCell}</td>
         <td><button onclick="selBle('${d.mac}','${(d.name||'').replace(/'/g,"")}')">выбрать</button> ${gotoBtn}</td>`;
       tb.appendChild(tr);
     });
